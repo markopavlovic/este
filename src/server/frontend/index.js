@@ -1,50 +1,23 @@
 import compression from 'compression';
-import config from '../config';
-import esteHeaders from '../lib/estemiddleware';
+import device from 'express-device';
+import esteMiddleware from '../lib/esteMiddleware';
 import express from 'express';
-// import favicon from 'serve-favicon';
 import render from './render';
 
 const app = express();
 
-// Add Este.js headers for React related routes only
-if (!config.isProduction)
-  app.use(esteHeaders());
-
+app.use(esteMiddleware());
 app.use(compression());
-// TODO: Add favicon.
-// app.use(favicon('assets/img/favicon.ico'))
-// TODO: Move to CDN.
-app.use('/build', express.static('build'));
-app.use('/assets', express.static('assets'));
 
-// Example how initialState, which is the same for all users, is enriched with
-// user state. With state-less Flux, we don't need instances.
-app.use((req, res, next) => {
+// Note we don't need serve-favicon middleware, it doesn't work with static
+// prerendered sites anyway.
 
-  const acceptsLanguages = req.acceptsLanguages(config.appLocales);
+// All assets must be handled via require syntax like this:
+// <img alt="50x50 placeholder" src={require('./50x50.png')} />
+app.use('/assets', express.static('build', {maxAge: '200d'}));
 
-  req.userState = {
-    i18n: {
-      locales: acceptsLanguages || config.defaultLocale
-    },
-    todos: {
-      list: [
-        {id: 2, title: 'relax'}
-      ]
-    }
-  };
-
-  // Simulate async loading from DB.
-  setTimeout(() => {
-    next();
-  }, 20);
-
-});
-
-app.get('*', (req, res, next) => {
-  render(req, res, req.userState).catch(next);
-});
+app.use(device.capture());
+app.get('*', render);
 
 app.on('mount', () => {
   console.log('App is available at %s', app.mountpath);

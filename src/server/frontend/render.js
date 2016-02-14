@@ -1,96 +1,113 @@
-import DocumentTitle from 'react-document-title';
-import Html from './html.react';
-import Immutable from 'immutable';
-import Promise from 'bluebird';
+import Helmet from 'react-helmet';
+import Html from './Html.react';
 import React from 'react';
-import Router from 'react-router';
+import ReactDOMServer from 'react-dom/server';
 import config from '../config';
-import initialState from '../initialstate';
-import routes from '../../client/routes';
-import {state} from '../../client/state';
-import stateMerger from '../lib/merger';
+import configureStore from '../../common/configureStore';
+import createRoutes from '../../browser/createRoutes';
+import serialize from 'serialize-javascript';
+import {IntlProvider} from 'react-intl';
+import {Provider} from 'react-redux';
+import {RouterContext, match} from 'react-router';
+import {createMemoryHistory} from 'react-router';
 
-export default function render(req, res, userState = {}) {
-  const appState = Immutable.fromJS(initialState).mergeWith(stateMerger, userState).toJS();
-  return renderPage(req, res, appState);
-}
+const fetchComponentDataAsync = async (dispatch, renderProps) => {
+  const {components, location, params} = renderProps;
+  const promises = components
+    .reduce((actions, component) =>
+      actions.concat(component.fetchActions || [])
+    , [])
+    .map(action =>
+      // Server side fetching can use only router location and params props.
+      // There is no easy way how to support custom component props.
+      dispatch(action({location, params})).payload.promise
+    );
+  await Promise.all(promises);
+};
 
-function renderPage(req, res, appState) {
-  return new Promise((resolve, reject) => {
+const getAppHtml = (store, renderProps) =>
+  ReactDOMServer.renderToString(
+    <Provider store={store}>
+      <IntlProvider>
+        <RouterContext {...renderProps} />
+      </IntlProvider>
+    </Provider>
+  );
 
-    const router = Router.create({
-      routes,
-      location: req.originalUrl,
-      onError: reject,
-      onAbort: (abortReason) => {
-        // Some requireAuth higher order component requested redirect.
-        if (abortReason.constructor.name === 'Redirect') {
-          const {to, params, query} = abortReason;
-          const path = router.makePath(to, params, query);
-          res.redirect(path);
-          resolve();
-          return;
-        }
-        reject(abortReason);
-      }
-    });
-
-    router.run((Handler, routerState) => {
-      const html = preloadAppStateThenRenderHtml(Handler, appState);
-      const notFound = routerState.routes.some(route => route.name === 'not-found');
-      const status = notFound ? 404 : 200;
-      res.status(status).send(html);
-      resolve();
-    });
-
-  });
-}
-
-function preloadAppStateThenRenderHtml(Handler, appState) {
-  // Load app state for server rendering.
-  state.load(appState);
-  return getPageHtml(Handler, appState);
-}
-
-function getPageHtml(Handler, appState) {
-  const appHtml = `<div id="app">${React.renderToString(<Handler />)}</div>`;
-  const appScriptSrc = config.isProduction
-    ? '/build/app.js?v=' + config.version
-    : '//localhost:8888/build/app.js';
-
-  // Serialize app state for client.
-  let scriptHtml = `
+const getScriptHtml = (state, headers, hostname, appJsFilename) =>
+  // Note how app state is serialized. JSON.stringify is anti-pattern.
+  // https://github.com/yahoo/serialize-javascript#user-content-automatic-escaping-of-html-characters
+  // Note how we use cdn.polyfill.io, en is default, but can be changed later.
+  `
+    <script src="https://cdn.polyfill.io/v2/polyfill.min.js?features=Intl.~locale.en"></script>
     <script>
-      (function() {
-        window._appState = ${JSON.stringify(appState)};
-        var app = document.createElement('script'); app.type = 'text/javascript'; app.async = true;
-        var src = '${appScriptSrc}';
-        // IE<11 and Safari need Intl polyfill.
-        if (!window.Intl) src = src.replace('.js', 'intl.js');
-        app.src = src;
-        var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(app, s);
-      })();
-    </script>`;
+      window.__INITIAL_STATE__ = ${serialize(state)};
+    </script>
+    <script src="${appJsFilename}"></script>
+  `;
 
-  if (config.isProduction && config.googleAnalyticsId !== 'UA-XXXXXXX-X')
-    scriptHtml += `
-      <script>
-        (function(b,o,i,l,e,r){b.GoogleAnalyticsObject=l;b[l]||(b[l]=
-        function(){(b[l].q=b[l].q||[]).push(arguments)});b[l].l=+new Date;
-        e=o.createElement(i);r=o.getElementsByTagName(i)[0];
-        e.src='//www.google-analytics.com/analytics.js';
-        r.parentNode.insertBefore(e,r)}(window,document,'script','ga'));
-        ga('create','${config.googleAnalyticsId}');ga('send','pageview');
-      </script>`;
-
-  const title = DocumentTitle.rewind();
-
-  return '<!DOCTYPE html>' + React.renderToStaticMarkup(
+const renderPage = (store, renderProps, req) => {
+  const state = store.getState();
+  const {headers, hostname} = req;
+  const appHtml = getAppHtml(store, renderProps);
+  const helmet = Helmet.rewind();
+  const {
+    styles: {app: appCssFilename},
+    javascript: {app: appJsFilename}
+  } = webpackIsomorphicTools.assets();
+  const scriptHtml = getScriptHtml(state, headers, hostname, appJsFilename);
+  if (!config.isProduction) {
+    webpackIsomorphicTools.refresh();
+  }
+  const docHtml = ReactDOMServer.renderToStaticMarkup(
     <Html
-      bodyHtml={appHtml + scriptHtml}
+      appCssFilename={appCssFilename}
+      bodyHtml={`<div id="app">${appHtml}</div>${scriptHtml}`}
+      googleAnalyticsId={config.googleAnalyticsId}
+      helmet={helmet}
       isProduction={config.isProduction}
-      title={title}
-      version={config.version}
     />
   );
+  return `<!DOCTYPE html>${docHtml}`;
+};
+
+export default function render(req, res, next) {
+  const initialState = {
+    device: {
+      isMobile: ['phone', 'tablet'].indexOf(req.device.type) > -1
+    }
+  };
+  const store = configureStore({initialState});
+
+  // Fetch logged in user here because routes may need it. Remember we can use
+  // store.dispatch method.
+
+  const routes = createRoutes(() => store.getState());
+  const location = createMemoryHistory().createLocation(req.url);
+
+  match({routes, location}, async (error, redirectLocation, renderProps) => {
+
+    if (redirectLocation) {
+      res.redirect(301, redirectLocation.pathname + redirectLocation.search);
+      return;
+    }
+
+    if (error) {
+      next(error);
+      return;
+    }
+
+    try {
+      await fetchComponentDataAsync(store.dispatch, renderProps);
+      const html = renderPage(store, renderProps, req);
+      // renderProps are always defined with * route.
+      // https://github.com/rackt/react-router/blob/master/docs/guides/advanced/ServerRendering.md
+      const status = renderProps.routes.some(route => route.path === '*')
+        ? 404
+        : 200;
+      res.status(status).send(html);
+    } catch (e) {
+      next(e);
+    }
+  });
 }

@@ -1,19 +1,32 @@
-const config = require('./config');
+require('babel-register');
 
-if (config.isProduction || require('piping')(config.piping)) {
-  if (!process.env.NODE_ENV)
-    throw new Error('Environment variable NODE_ENV must be set.');
+const Bluebird = require('bluebird');
+const WebpackIsomorphicTools = require('webpack-isomorphic-tools');
+const rootDir = require('path').resolve(__dirname, '..', '..');
+const serverConfig = require('./config');
+const webpackIsomorphicAssets = require('../../webpack/assets');
 
-  // Load and use polyfill for ECMA-402.
-  if (!global.Intl)
-    global.Intl = require('intl');
+if (!process.env.NODE_ENV)
+  throw new Error(
+    'Environment variable NODE_ENV must be set to development or production.'
+  );
 
-  require('babel/register');
+// http://bluebirdjs.com/docs/why-bluebird.html
+global.Promise = Bluebird;
 
-  // To ignore webpack custom loaders on server.
-  config.webpackStylesExtensions.forEach(function(ext) {
-    require.extensions['.' + ext] = function() {};
-  });
-
-  require('./main');
+// http://formatjs.io/guides/runtime-environments/#polyfill-node
+if (global.Intl) {
+  // We don't have to check whether Node runtime supports specific language,
+  // because without special build it does support only english anyway.
+  require('intl');
+  global.Intl.NumberFormat = global.IntlPolyfill.NumberFormat;
+  global.Intl.DateTimeFormat = global.IntlPolyfill.DateTimeFormat;
+} else {
+  global.Intl = require('intl');
 }
+
+global.webpackIsomorphicTools = new WebpackIsomorphicTools(webpackIsomorphicAssets)
+  .development(!serverConfig.isProduction)
+  .server(rootDir, () => {
+    require('./main');
+  });
